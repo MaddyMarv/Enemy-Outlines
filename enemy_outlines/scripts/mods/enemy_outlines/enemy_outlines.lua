@@ -1,6 +1,7 @@
 local mod = get_mod("enemy_outlines")
 
 local OutlineSettings = require("scripts/settings/outline/outline_settings")
+local HitZone = require("scripts/utilities/attack/hit_zone")
 
 local function get_rgb_color(prefix)
     local c = mod:get(prefix .. "_color")
@@ -182,17 +183,55 @@ local function _clear_all_mod_outlines()
     end
 end
 
+local CATEGORY_SETTINGS = {
+    human_boss = "outline_human_bosses",
+    monster = "outline_monsters",
+    disabler = "outline_disablers",
+    ranged_special = "outline_ranged_specials",
+    poxburster = "outline_poxbursters",
+    ranged_elite = "outline_ranged_elites",
+    melee_elite = "outline_melee_elites",
+    crushers_maulers = "outline_crushers_maulers",
+    shooters = "outline_shooters",
+    chaff = "outline_chaff",
+}
+
+local _enabled_outline = {}
+local _only_targeting_me = false
+local _max_dist_sq = nil
+local _enable_aimed = false
+local _aimed_ignore_distance = false
+
+local function refresh_settings()
+    for category, setting_id in pairs(CATEGORY_SETTINGS) do
+        _enabled_outline[category] = mod:get(setting_id) and ("mod_outline_" .. category) or nil
+    end
+    _only_targeting_me = mod:get("only_targeting_me")
+    local max_distance = mod:get("max_distance")
+    if max_distance == nil then max_distance = 30 end
+    _max_dist_sq = max_distance > 0 and (max_distance * max_distance) or nil
+    _enable_aimed = mod:get("outline_aimed")
+    _aimed_ignore_distance = mod:get("aimed_ignore_distance_limit")
+end
+
+refresh_settings()
+
 local _refresh_outlines = false
+local _aimed_unit = nil
+
 mod.on_setting_changed = function(setting_id)
+    refresh_settings()
     update_outline_settings()
     _refresh_outlines = true
 end
 
 mod.on_disabled = function(initial_call)
     _clear_all_mod_outlines()
+    _aimed_unit = nil
 end
 
 mod.on_enabled = function(initial_call)
+    refresh_settings()
     update_outline_settings()
     _refresh_outlines = true
 end
@@ -202,16 +241,16 @@ mod.on_unload = function(exit_game)
 end
 
 local function _resolve_target_from_game_object(enemy_unit, game_session, unit_spawner)
-    local ok_go_id, game_object_id = pcall(function() return unit_spawner:game_object_id(enemy_unit) end)
+    local ok_go_id, game_object_id = pcall(unit_spawner.game_object_id, unit_spawner, enemy_unit)
     if not ok_go_id or not game_object_id then return nil end
 
-    local ok_has_field, has_field = pcall(function() return GameSession.has_game_object_field(game_session, game_object_id, "target_unit_id") end)
+    local ok_has_field, has_field = pcall(GameSession.has_game_object_field, game_session, game_object_id, "target_unit_id")
     if not ok_has_field or has_field ~= true then return nil end
 
-    local ok_target_id, target_unit_id = pcall(function() return GameSession.game_object_field(game_session, game_object_id, "target_unit_id") end)
+    local ok_target_id, target_unit_id = pcall(GameSession.game_object_field, game_session, game_object_id, "target_unit_id")
     if not ok_target_id or not target_unit_id or target_unit_id == NetworkConstants.invalid_game_object_id then return nil end
 
-    local ok_unit, target_unit = pcall(function() return unit_spawner:unit(target_unit_id) end)
+    local ok_unit, target_unit = pcall(unit_spawner.unit, unit_spawner, target_unit_id)
     if ok_unit and target_unit and HEALTH_ALIVE[target_unit] and Unit.alive(target_unit) then
         return target_unit
     end
@@ -271,6 +310,99 @@ local _last_scan_time = 0
 local _unit_category_cache = setmetatable({}, { __mode = "k" })
 local _unit_is_enemy_cache = setmetatable({}, { __mode = "k" })
 
+local function _is_enemy(unit, side_system, enemy_side_names)
+    local is_enemy = _unit_is_enemy_cache[unit]
+    if is_enemy == nil then
+        is_enemy = false
+        local unit_side = side_system.side_by_unit[unit]
+        if unit_side then
+            local unit_side_name = unit_side:name()
+            for i = 1, #enemy_side_names do
+                if enemy_side_names[i] == unit_side_name then
+                    is_enemy = true
+                    break
+                end
+            end
+        end
+        _unit_is_enemy_cache[unit] = is_enemy
+    end
+    return is_enemy
+end
+
+local function _in_range(player_pos, unit)
+    if not _max_dist_sq or not player_pos then
+        return true
+    end
+    local enemy_pos = Unit.local_position(unit, 1)
+    return enemy_pos ~= nil and Vector3.distance_squared(player_pos, enemy_pos) <= _max_dist_sq
+end
+
+local AIM_RAY_MAX_DISTANCE = 200
+
+local function _enemy_under_crosshair(player_unit, side_system, enemy_side_names)
+    local unit_data_extension = ScriptUnit.has_extension(player_unit, "unit_data_system")
+    local first_person = unit_data_extension and unit_data_extension:read_component("first_person")
+    local world = first_person and Managers.world:world("level_world")
+    local physics_world = world and World.physics_world(world)
+    if not physics_world then
+        return nil
+    end
+
+    local ray_length = AIM_RAY_MAX_DISTANCE
+    if not _aimed_ignore_distance and _max_dist_sq then
+        ray_length = math.sqrt(_max_dist_sq) + 2
+    end
+
+    local hits = PhysicsWorld.raycast(physics_world, first_person.position, Quaternion.forward(first_person.rotation), ray_length,
+        "all", "types", "both", "max_hits", 32, "collision_filter", "filter_player_character_shooting_raycast")
+    if not hits then
+        return nil
+    end
+
+    local side_by_unit = side_system.side_by_unit
+    local best_distance = ray_length + 1
+    local best_unit = nil
+    for i = 1, #hits do
+        local hit = hits[i]
+        local distance = hit.distance or hit[2]
+        if distance < best_distance then
+            local actor = hit.actor or hit[4]
+            local unit = actor and Actor.unit(actor)
+            if unit and unit ~= player_unit then
+                if not side_by_unit[unit] then
+                    best_distance = distance
+                    best_unit = nil
+                elseif HEALTH_ALIVE[unit] and _is_enemy(unit, side_system, enemy_side_names) and HitZone.get_name(unit, actor) ~= "afro" then
+                    best_distance = distance
+                    best_unit = unit
+                end
+            end
+        end
+    end
+    return best_unit
+end
+
+local function _update_aimed_outline(outline_system, side_system, enemy_side_names, player_unit, player_pos)
+    local target = nil
+    if _enable_aimed then
+        local unit = _enemy_under_crosshair(player_unit, side_system, enemy_side_names)
+        if unit and Unit.alive(unit) and outline_system._unit_extension_data[unit] ~= nil
+            and (_aimed_ignore_distance or _in_range(player_pos, unit)) then
+            target = unit
+        end
+    end
+
+    local previous = _aimed_unit
+    if previous and previous ~= target and outline_system._unit_extension_data[previous] ~= nil
+        and outline_system:has_outline(previous, "mod_outline_aimed") then
+        outline_system:remove_outline(previous, "mod_outline_aimed")
+    end
+    if target and not outline_system:has_outline(target, "mod_outline_aimed") then
+        outline_system:add_outline(target, "mod_outline_aimed")
+    end
+    _aimed_unit = target
+end
+
 mod.update = function(dt)
     if not mod:is_enabled() then
         return
@@ -299,219 +431,78 @@ mod.update = function(dt)
     local enemy_side_names = player_side:relation_side_names("enemy")
     if not enemy_side_names then return end
 
-    local game_session_manager = Managers.state.game_session
-    local unit_spawner = Managers.state.unit_spawner
-    local game_session = nil
-    if run_heavy_scan and game_session_manager and type(game_session_manager.game_session) == "function" then
-        pcall(function() game_session = game_session_manager:game_session() end)
-    end
-
-    local perception_system = extension_manager:system("perception_system")
-    local perception_map = nil
-    if run_heavy_scan and perception_system and type(perception_system.unit_to_extension_map) == "function" then
-        pcall(function() perception_map = perception_system:unit_to_extension_map() end)
-    end
-
-    local enable_human_bosses = mod:get("outline_human_bosses")
-    local enable_monsters = mod:get("outline_monsters")
-    local enable_disablers = mod:get("outline_disablers")
-    local enable_ranged_specials = mod:get("outline_ranged_specials")
-    local enable_poxbursters = mod:get("outline_poxbursters")
-    local enable_ranged_elites = mod:get("outline_ranged_elites")
-    local enable_melee_elites = mod:get("outline_melee_elites")
-    local enable_crushers_maulers = mod:get("outline_crushers_maulers")
-    local enable_shooters = mod:get("outline_shooters")
-    local enable_chaff = mod:get("outline_chaff")
-    local only_targeting_me = mod:get("only_targeting_me")
-    local max_distance = mod:get("max_distance")
-    if max_distance == nil then max_distance = 30 end
-    local max_dist_sq = max_distance > 0 and (max_distance * max_distance) or nil
     local player_pos = Unit.local_position(player_unit, 1)
-    local enable_aimed = mod:get("outline_aimed")
-    local aimed_ignore_distance = mod:get("aimed_ignore_distance_limit")
-    local aimed_target = nil
-    if enable_aimed and player_unit then
-        local smart_targeting_extension = ScriptUnit.has_extension(player_unit, "smart_targeting_system") and ScriptUnit.extension(player_unit, "smart_targeting_system")
-        if smart_targeting_extension then
-            local targeting_data = smart_targeting_extension:targeting_data()
-            if targeting_data and targeting_data.unit then
-                aimed_target = targeting_data.unit
+
+    if run_heavy_scan then
+        local refresh = _refresh_outlines
+        _refresh_outlines = false
+        if refresh then
+            _aimed_unit = nil
+        end
+
+        local unit_spawner, game_session, perception_map = nil, nil, nil
+        if _only_targeting_me then
+            unit_spawner = Managers.state.unit_spawner
+            local game_session_manager = Managers.state.game_session
+            if game_session_manager and type(game_session_manager.game_session) == "function" then
+                local ok, session = pcall(game_session_manager.game_session, game_session_manager)
+                game_session = ok and session or nil
+            end
+
+            local perception_system = extension_manager:system("perception_system")
+            if perception_system and type(perception_system.unit_to_extension_map) == "function" then
+                local ok, map = pcall(perception_system.unit_to_extension_map, perception_system)
+                perception_map = ok and map or nil
             end
         end
-    end
-    
-    local refresh = _refresh_outlines
-    _refresh_outlines = false
 
-    for unit, _ in pairs(side_system.side_by_unit) do
-        if HEALTH_ALIVE[unit] and Unit.alive(unit) then
-            local is_enemy = _unit_is_enemy_cache[unit]
-            if is_enemy == nil then
-                is_enemy = false
-                local unit_side = side_system.side_by_unit[unit]
-                if unit_side then
-                    local unit_side_name = unit_side:name()
-                    for i = 1, #enemy_side_names do
-                        if enemy_side_names[i] == unit_side_name then
-                            is_enemy = true
-                            break
+        for unit, _ in pairs(side_system.side_by_unit) do
+            if HEALTH_ALIVE[unit] and Unit.alive(unit) and _is_enemy(unit, side_system, enemy_side_names)
+                and outline_system._unit_extension_data[unit] ~= nil then
+                if refresh then
+                    for i = 1, #_MOD_OUTLINE_NAMES do
+                        local name = _MOD_OUTLINE_NAMES[i]
+                        if outline_system:has_outline(unit, name) then
+                            outline_system:remove_outline(unit, name)
                         end
                     end
                 end
-                _unit_is_enemy_cache[unit] = is_enemy
-            end
 
-            if is_enemy then
                 local category = _unit_category_cache[unit]
                 if category == nil then
                     category = _get_enemy_category(unit) or false
                     _unit_category_cache[unit] = category
                 end
-                
-                if category then
-                    local allowed_by_settings = false
-                    local outline_name = nil
 
-                    if category == "human_boss" and enable_human_bosses then
-                        allowed_by_settings = true
-                        outline_name = "mod_outline_human_boss"
-                    elseif category == "monster" and enable_monsters then
-                        allowed_by_settings = true
-                        outline_name = "mod_outline_monster"
-                    elseif category == "disabler" and enable_disablers then
-                        allowed_by_settings = true
-                        outline_name = "mod_outline_disabler"
-                    elseif category == "ranged_special" and enable_ranged_specials then
-                        allowed_by_settings = true
-                        outline_name = "mod_outline_ranged_special"
-                    elseif category == "poxburster" and enable_poxbursters then
-                        allowed_by_settings = true
-                        outline_name = "mod_outline_poxburster"
-                    elseif category == "ranged_elite" and enable_ranged_elites then
-                        allowed_by_settings = true
-                        outline_name = "mod_outline_ranged_elite"
-                    elseif category == "melee_elite" and enable_melee_elites then
-                        allowed_by_settings = true
-                        outline_name = "mod_outline_melee_elite"
-                    elseif category == "crushers_maulers" and enable_crushers_maulers then
-                        allowed_by_settings = true
-                        outline_name = "mod_outline_crushers_maulers"
-                    elseif category == "shooters" and enable_shooters then
-                        allowed_by_settings = true
-                        outline_name = "mod_outline_shooters"
-                    elseif category == "chaff" and enable_chaff then
-                        allowed_by_settings = true
-                        outline_name = "mod_outline_chaff"
+                local outline_name = category and _enabled_outline[category]
+                if outline_name then
+                    local should_outline = false
+                    if _in_range(player_pos, unit) and _check_line_of_sight(player_unit, unit) then
+                        if _only_targeting_me then
+                            local target_unit = nil
+                            if game_session and unit_spawner then
+                                target_unit = _resolve_target_from_game_object(unit, game_session, unit_spawner)
+                            end
+                            if not target_unit then
+                                target_unit = _resolve_target_from_perception(unit, perception_map)
+                            end
+                            should_outline = target_unit == player_unit
+                        else
+                            should_outline = true
+                        end
                     end
 
-                    local has_extension = outline_system._unit_extension_data[unit] ~= nil
-                    if has_extension then
-                        if refresh then
-                            if outline_system:has_outline(unit, "mod_outline_human_boss") then outline_system:remove_outline(unit, "mod_outline_human_boss") end
-                            if outline_system:has_outline(unit, "mod_outline_monster") then outline_system:remove_outline(unit, "mod_outline_monster") end
-                            if outline_system:has_outline(unit, "mod_outline_disabler") then outline_system:remove_outline(unit, "mod_outline_disabler") end
-                            if outline_system:has_outline(unit, "mod_outline_ranged_special") then outline_system:remove_outline(unit, "mod_outline_ranged_special") end
-                            if outline_system:has_outline(unit, "mod_outline_poxburster") then outline_system:remove_outline(unit, "mod_outline_poxburster") end
-                            if outline_system:has_outline(unit, "mod_outline_ranged_elite") then outline_system:remove_outline(unit, "mod_outline_ranged_elite") end
-                            if outline_system:has_outline(unit, "mod_outline_melee_elite") then outline_system:remove_outline(unit, "mod_outline_melee_elite") end
-                            if outline_system:has_outline(unit, "mod_outline_crushers_maulers") then outline_system:remove_outline(unit, "mod_outline_crushers_maulers") end
-                            if outline_system:has_outline(unit, "mod_outline_shooters") then outline_system:remove_outline(unit, "mod_outline_shooters") end
-                            if outline_system:has_outline(unit, "mod_outline_chaff") then outline_system:remove_outline(unit, "mod_outline_chaff") end
-                            if outline_system:has_outline(unit, "mod_outline_aimed") then outline_system:remove_outline(unit, "mod_outline_aimed") end
+                    if should_outline then
+                        if not outline_system:has_outline(unit, outline_name) then
+                            outline_system:add_outline(unit, outline_name)
                         end
-
-                        local in_range = true
-                        if max_dist_sq and player_pos then
-                            local enemy_pos = Unit.local_position(unit, 1)
-                            if not enemy_pos or Vector3.distance_squared(player_pos, enemy_pos) > max_dist_sq then
-                                in_range = false
-                            end
-                        end
-
-                        if run_heavy_scan then
-                            local should_outline = false
-                            if allowed_by_settings and in_range then
-                                local passes_los = _check_line_of_sight(player_unit, unit)
-
-                                if passes_los then
-                                    if only_targeting_me then
-                                        local target_unit = nil
-                                        if game_session and unit_spawner then
-                                            target_unit = _resolve_target_from_game_object(unit, game_session, unit_spawner)
-                                        end
-                                        if not target_unit then
-                                            target_unit = _resolve_target_from_perception(unit, perception_map)
-                                        end
-
-                                        if target_unit == player_unit then
-                                            should_outline = true
-                                        end
-                                    else
-                                        should_outline = true
-                                    end
-                                end
-                            end
-
-                            if should_outline then
-                                if not outline_system:has_outline(unit, outline_name) then
-                                    outline_system:add_outline(unit, outline_name)
-                                end
-                            else
-                                if outline_system:has_outline(unit, outline_name) then
-                                    outline_system:remove_outline(unit, outline_name)
-                                end
-                            end
-                        end
-                        
-                        if enable_aimed and (in_range or aimed_ignore_distance) then
-                            if unit == aimed_target then
-                                if not outline_system:has_outline(unit, "mod_outline_aimed") then
-                                    outline_system:add_outline(unit, "mod_outline_aimed")
-                                end
-                            else
-                                if outline_system:has_outline(unit, "mod_outline_aimed") then
-                                    outline_system:remove_outline(unit, "mod_outline_aimed")
-                                end
-                            end
-                        else
-                            if outline_system:has_outline(unit, "mod_outline_aimed") then
-                                outline_system:remove_outline(unit, "mod_outline_aimed")
-                            end
-                        end
-                    end
-                else
-                    local has_extension = outline_system._unit_extension_data[unit] ~= nil
-                    if has_extension then
-                        if refresh and outline_system:has_outline(unit, "mod_outline_aimed") then
-                            outline_system:remove_outline(unit, "mod_outline_aimed")
-                        end
-
-                        local in_range = true
-                        if max_dist_sq and player_pos then
-                            local enemy_pos = Unit.local_position(unit, 1)
-                            if not enemy_pos or Vector3.distance_squared(player_pos, enemy_pos) > max_dist_sq then
-                                in_range = false
-                            end
-                        end
-
-                        if enable_aimed and (in_range or aimed_ignore_distance) then
-                            if unit == aimed_target then
-                                if not outline_system:has_outline(unit, "mod_outline_aimed") then
-                                    outline_system:add_outline(unit, "mod_outline_aimed")
-                                end
-                            else
-                                if outline_system:has_outline(unit, "mod_outline_aimed") then
-                                    outline_system:remove_outline(unit, "mod_outline_aimed")
-                                end
-                            end
-                        else
-                            if outline_system:has_outline(unit, "mod_outline_aimed") then
-                                outline_system:remove_outline(unit, "mod_outline_aimed")
-                            end
-                        end
+                    elseif outline_system:has_outline(unit, outline_name) then
+                        outline_system:remove_outline(unit, outline_name)
                     end
                 end
             end
         end
     end
+
+    _update_aimed_outline(outline_system, side_system, enemy_side_names, player_unit, player_pos)
 end
