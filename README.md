@@ -11,7 +11,7 @@ Highlights specials, elites, and enemies with outlines.
 **General**
 - Only Show Enemies Targeting Me
 - Max Outline Distance
-- Aimed Enemy Highlight & Color
+- Outline Aimed Enemy (Ignore Distance Limit for Aimed Target, Color)
 - Threat Outline & Color Options (Human Bosses, Monsters, Disablers, Ranged Specials, Poxbursters, Ranged Elites, Melee Elites, Crushers & Maulers, Shooters, Chaff)
 </details>
 

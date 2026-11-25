@@ -3,7 +3,7 @@ return {
 		en = "Enemy Outlines",
 	},
 	mod_description = {
-		en = "Highlights specials, elites, and enemies with outlines.",
+		en = "Highlights specials, elites, and enemies with outlines. Outlines do not show through walls.",
 	},
 	group_human_bosses = {
 		en = "Human Bosses (Captains, Twins)",

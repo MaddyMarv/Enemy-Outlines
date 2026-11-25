@@ -7,7 +7,7 @@
     "funding": {
         "kofi": "https://ko-fi.com/indicabunny"
     },
-    "description": "Highlights specials, elites, and enemies with outlines.",
+    "description": "Highlights specials, elites, and enemies with outlines. Outlines do not show through walls.",
     "dependencies": {
         "required": [],
         "self_after": [],
