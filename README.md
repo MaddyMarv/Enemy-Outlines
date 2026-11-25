@@ -15,4 +15,4 @@ Highlights specials, elites, and enemies with outlines.
 - Threat Outline & Color Options (Human Bosses, Monsters, Disablers, Ranged Specials, Poxbursters, Ranged Elites, Melee Elites, Crushers & Maulers, Shooters, Chaff)
 </details>
 
-🔗 **Links:** [Source Code](https://github.com/MaddyMarv/Enemy-outlines) | [Nexus Mods Profile](https://www.nexusmods.com/profile/indicabunny) | [Support Me on Ko-fi](https://ko-fi.com/indicabunny)
+🔗 **Links:** [Source Code](https://github.com/MaddyMarv/Enemy-Outlines) | [Nexus Mods Profile](https://www.nexusmods.com/profile/indicabunny) | [Support Me on Ko-fi](https://ko-fi.com/indicabunny)

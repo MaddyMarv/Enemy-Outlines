@@ -12,4 +12,4 @@ Highlights specials, elites, and enemies with outlines.
 [/spoiler]
 
 [b]Links:[/b]
-[url=https://github.com/MaddyMarv/Enemy-outlines]Source Code[/url] | [url=https://www.nexusmods.com/profile/indicabunny]Nexus Mods Profile[/url] | [url=https://ko-fi.com/indicabunny]Support Me on Ko-fi[/url]
+[url=https://github.com/MaddyMarv/Enemy-Outlines]Source Code[/url] | [url=https://www.nexusmods.com/profile/indicabunny]Nexus Mods Profile[/url] | [url=https://ko-fi.com/indicabunny]Support Me on Ko-fi[/url]
